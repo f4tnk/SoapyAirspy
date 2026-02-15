@@ -31,6 +31,29 @@ if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" MATCH
     list(APPEND AIRSPY_LIBS -pthread)
     #disable warnings for unused parameters
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+
+    # SDR performance optimization flags
+    include(CheckCXXCompilerFlag)
+
+    CHECK_CXX_COMPILER_FLAG("-march=native" HAS_MARCH_NATIVE)
+    if(HAS_MARCH_NATIVE)
+        add_compile_options(-march=native)
+    endif()
+
+    CHECK_CXX_COMPILER_FLAG("-ffast-math" HAS_FAST_MATH)
+    if(HAS_FAST_MATH)
+        add_compile_options(-ffast-math)
+    endif()
+
+    CHECK_CXX_COMPILER_FLAG("-ftree-vectorize" HAS_TREE_VECTORIZE)
+    if(HAS_TREE_VECTORIZE)
+        add_compile_options(-ftree-vectorize)
+    endif()
+
+    CHECK_CXX_COMPILER_FLAG("-flto" HAS_LTO)
+    if(HAS_LTO)
+        add_compile_options(-flto)
+    endif()
 endif()
 
 if (APPLE)

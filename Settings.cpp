@@ -34,17 +34,24 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
 
     agcMode = false;
     rfBias = false;
-    bitPack = false;
+    bitPack = true;
 
     bufferedElems = 0;
     resetBuffer = false;
 
     streamActive = false;
     sampleRateChanged.store(false);
+    _overflowCount.store(0);
 
     dev = nullptr;
 
-    lnaGain = mixerGain = vgaGain = 0;
+    // Optimized default gains for weak-signal reception (satellites, APRS, AIS)
+    lnaGain = 10;
+    mixerGain = 7;
+    vgaGain = 10;
+    linearityGain = 0;
+    sensitivityGain = 0;
+    ppmCorrection = 0.0;
 
     dev = nullptr;
     std::stringstream serialstr;
@@ -78,6 +85,14 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
         const auto it = args.find(info.key);
         if (it != args.end()) this->writeSetting(it->first, it->second);
     }
+
+    //program hardware with optimized defaults
+    airspy_set_lna_gain(dev, lnaGain);
+    airspy_set_mixer_gain(dev, mixerGain);
+    airspy_set_vga_gain(dev, vgaGain);
+    airspy_set_packing(dev, bitPack ? 1 : 0);
+    SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy defaults: LNA=%d MIX=%d VGA=%d packing=%s",
+        lnaGain, mixerGain, vgaGain, bitPack ? "on" : "off");
 }
 
 SoapyAirspy::~SoapyAirspy(void)
@@ -149,7 +164,7 @@ std::string SoapyAirspy::getAntenna(const int direction, const size_t channel) c
 
 bool SoapyAirspy::hasDCOffsetMode(const int direction, const size_t channel) const
 {
-    return false;
+    return true;
 }
 
 /*******************************************************************
@@ -257,8 +272,10 @@ void SoapyAirspy::setFrequency(
     {
         centerFrequency = (uint32_t) frequency;
         resetBuffer = true;
-        SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting center freq: %d", centerFrequency);
-        airspy_set_freq(dev, centerFrequency);
+        //apply PPM correction to compensate crystal oscillator drift
+        const uint32_t corrected = (uint32_t)(frequency * (1.0 + ppmCorrection / 1e6));
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting center freq: %u (corrected: %u, PPM: %.1f)", centerFrequency, corrected, ppmCorrection);
+        airspy_set_freq(dev, corrected);
     }
 }
 
@@ -375,15 +392,44 @@ SoapySDR::ArgInfoList SoapyAirspy::getSettingInfo(void) const
 
     setArgs.push_back(biasOffsetArg);
 
-    // bitpack
+    // bitpack — enabled by default for 25% USB bandwidth savings
     SoapySDR::ArgInfo bitPackingArg;
     bitPackingArg.key = "bitpack";
-    bitPackingArg.value = "false";
+    bitPackingArg.value = "true";
     bitPackingArg.name = "Bit Pack";
-    bitPackingArg.description = "Enable packing 4 12-bit samples into 3 16-bit words for 25% less USB trafic.";
+    bitPackingArg.description = "Pack 4x 12-bit samples into 3x 16-bit words (25% less USB traffic). Enabled by default.";
     bitPackingArg.type = SoapySDR::ArgInfo::BOOL;
 
     setArgs.push_back(bitPackingArg);
+
+    // PPM frequency correction
+    SoapySDR::ArgInfo ppmArg;
+    ppmArg.key = "ppm";
+    ppmArg.value = "0.0";
+    ppmArg.name = "PPM Correction";
+    ppmArg.description = "Crystal oscillator frequency correction in parts per million. Compensates for TCXO drift.";
+    ppmArg.type = SoapySDR::ArgInfo::FLOAT;
+    setArgs.push_back(ppmArg);
+
+    // Linearity gain mode
+    SoapySDR::ArgInfo linGainArg;
+    linGainArg.key = "linearity_gain";
+    linGainArg.value = "0";
+    linGainArg.name = "Linearity Gain";
+    linGainArg.description = "Pre-tuned gain table optimized for linearity (0-21). Sets LNA/MIX/VGA internally for best IMD performance.";
+    linGainArg.type = SoapySDR::ArgInfo::INT;
+    linGainArg.range = SoapySDR::Range(0, 21);
+    setArgs.push_back(linGainArg);
+
+    // Sensitivity gain mode
+    SoapySDR::ArgInfo sensGainArg;
+    sensGainArg.key = "sensitivity_gain";
+    sensGainArg.value = "0";
+    sensGainArg.name = "Sensitivity Gain";
+    sensGainArg.description = "Pre-tuned gain table optimized for sensitivity/SNR (0-21). Best for weak satellite and telemetry signals.";
+    sensGainArg.type = SoapySDR::ArgInfo::INT;
+    sensGainArg.range = SoapySDR::Range(0, 21);
+    setArgs.push_back(sensGainArg);
 
     return setArgs;
 }
@@ -393,28 +439,55 @@ void SoapyAirspy::writeSetting(const std::string &key, const std::string &value)
     if (key == "biastee") {
         bool enable = (value == "true");
         rfBias = enable;
-
         airspy_set_rf_bias(dev, enable);
     }
-
-     if (key == "bitpack") {
+    else if (key == "bitpack") {
         bool enable = (value == "true");
         bitPack = enable;
-
-        airspy_set_packing(dev, enable);
+        airspy_set_packing(dev, enable ? 1 : 0);
     }
-
+    else if (key == "ppm") {
+        try { ppmCorrection = std::stod(value); }
+        catch (...) { ppmCorrection = 0.0; }
+        //re-apply current frequency with new correction
+        if (centerFrequency > 0) {
+            const uint32_t corrected = (uint32_t)(centerFrequency * (1.0 + ppmCorrection / 1e6));
+            airspy_set_freq(dev, corrected);
+        }
+        SoapySDR_logf(SOAPY_SDR_INFO, "PPM correction set to %.2f", ppmCorrection);
+    }
+    else if (key == "linearity_gain") {
+        try { linearityGain = uint8_t(std::stoi(value)); }
+        catch (...) { linearityGain = 0; }
+        if (linearityGain > 21) linearityGain = 21;
+        airspy_set_linearity_gain(dev, linearityGain);
+        SoapySDR_logf(SOAPY_SDR_INFO, "Linearity gain set to %d", linearityGain);
+    }
+    else if (key == "sensitivity_gain") {
+        try { sensitivityGain = uint8_t(std::stoi(value)); }
+        catch (...) { sensitivityGain = 0; }
+        if (sensitivityGain > 21) sensitivityGain = 21;
+        airspy_set_sensitivity_gain(dev, sensitivityGain);
+        SoapySDR_logf(SOAPY_SDR_INFO, "Sensitivity gain set to %d", sensitivityGain);
+    }
 }
 
 std::string SoapyAirspy::readSetting(const std::string &key) const
 {
     if (key == "biastee") {
-        return rfBias?"true":"false";
+        return rfBias ? "true" : "false";
     }
     if (key == "bitpack") {
-        return bitPack?"true":"false";
+        return bitPack ? "true" : "false";
     }
-
-    // SoapySDR_logf(SOAPY_SDR_WARNING, "Unknown setting '%s'", key.c_str());
+    if (key == "ppm") {
+        return std::to_string(ppmCorrection);
+    }
+    if (key == "linearity_gain") {
+        return std::to_string(linearityGain);
+    }
+    if (key == "sensitivity_gain") {
+        return std::to_string(sensitivityGain);
+    }
     return "";
 }

@@ -41,32 +41,30 @@ std::vector<std::string> SoapyAirspy::getStreamFormats(const int direction, cons
 }
 
 std::string SoapyAirspy::getNativeStreamFormat(const int direction, const size_t channel, double &fullScale) const {
-     fullScale = 32767;
-     return SOAPY_SDR_CS16;
+     fullScale = 1.0;
+     return SOAPY_SDR_CF32;
 }
 
 SoapySDR::ArgInfoList SoapyAirspy::getStreamArgsInfo(const int direction, const size_t channel) const {
     SoapySDR::ArgInfoList streamArgs;
 
-    // SoapySDR::ArgInfo chanArg;
-    // chanArg.key = "chan";
-    // chanArg.value = "mono_l";
-    // chanArg.name = "Channel Setup";
-    // chanArg.description = "Input channel configuration.";
-    // chanArg.type = SoapySDR::ArgInfo::STRING;
-    // std::vector<std::string> chanOpts;
-    // std::vector<std::string> chanOptNames;
-    // chanOpts.push_back("mono_l");
-    // chanOptNames.push_back("Mono Left");
-    // chanOpts.push_back("mono_r");
-    // chanOptNames.push_back("Mono Right");
-    // chanOpts.push_back("stereo_iq");
-    // chanOptNames.push_back("Complex L/R = I/Q");
-    // chanOpts.push_back("stereo_qi");
-    // chanOptNames.push_back("Complex L/R = Q/I");
-    // chanArg.options = chanOpts;
-    // chanArg.optionNames = chanOptNames;
-    // streamArgs.push_back(chanArg);
+    SoapySDR::ArgInfo buffersArg;
+    buffersArg.key = "buffers";
+    buffersArg.value = std::to_string(DEFAULT_NUM_BUFFERS);
+    buffersArg.name = "Buffer Count";
+    buffersArg.description = "Number of async ring buffers for the producer-consumer queue.";
+    buffersArg.units = "";
+    buffersArg.type = SoapySDR::ArgInfo::INT;
+    streamArgs.push_back(buffersArg);
+
+    SoapySDR::ArgInfo bufLenArg;
+    bufLenArg.key = "buflen";
+    bufLenArg.value = std::to_string(DEFAULT_BUFFER_BYTES);
+    bufLenArg.name = "Buffer Size";
+    bufLenArg.description = "Size of each async buffer in bytes. Larger values reduce USB overhead.";
+    bufLenArg.units = "bytes";
+    bufLenArg.type = SoapySDR::ArgInfo::INT;
+    streamArgs.push_back(bufLenArg);
 
     return streamArgs;
 }
@@ -84,22 +82,24 @@ static int _rx_callback(airspy_transfer *t)
 
 int SoapyAirspy::rx_callback(airspy_transfer *t)
 {
-    if (sampleRateChanged.load()) {
+    if (SDR_UNLIKELY(sampleRateChanged.load())) {
         return 1;
     }
 
-    //printf("_rx_callback %d _buf_head=%d, numBuffers=%d\n", len, _buf_head, _buf_tail);
     //overflow condition: the caller is not reading fast enough
-    if (_buf_count == numBuffers)
+    if (SDR_UNLIKELY(_buf_count == numBuffers))
     {
         _overflowEvent = true;
+        _overflowCount++;
         return 0;
     }
 
+    const size_t bytes = t->sample_count * bytesPerSample;
+
     //copy into the buffer queue
     auto &buff = _buffs[_buf_tail];
-    buff.resize(t->sample_count * bytesPerSample);
-    std::memcpy(buff.data(), t->samples, t->sample_count * bytesPerSample);
+    buff.resize(bytes);
+    std::memcpy(buff.data(), t->samples, bytes);
 
     //increment the tail pointer
     _buf_tail = (_buf_tail + 1) % numBuffers;
@@ -152,20 +152,37 @@ SoapySDR::Stream *SoapyAirspy::setupStream(
 
     bytesPerSample = SoapySDR::formatToSize(format);
 
+    //parse stream args for buffer configuration
+    size_t reqBufferBytes = DEFAULT_BUFFER_BYTES;
+    if (args.count("buffers") != 0) {
+        try { numBuffers = std::stoul(args.at("buffers")); }
+        catch (...) { numBuffers = DEFAULT_NUM_BUFFERS; }
+        if (numBuffers < 4) numBuffers = 4;
+        if (numBuffers > 64) numBuffers = 64;
+    }
+    if (args.count("buflen") != 0) {
+        try { reqBufferBytes = std::stoul(args.at("buflen")); }
+        catch (...) { reqBufferBytes = DEFAULT_BUFFER_BYTES; }
+    }
+
     //We get this many complex samples over the bus.
     //Its the same for both complex float and int16.
-    //TODO adjust when packing is enabled
-    bufferLength = DEFAULT_BUFFER_BYTES/4;
+    bufferLength = reqBufferBytes / 4;
 
     //clear async fifo counts
     _buf_tail = 0;
     _buf_count = 0;
     _buf_head = 0;
+    _overflowEvent = false;
+    _overflowCount = 0;
 
-    //allocate buffers
+    //allocate buffers — pre-allocate to avoid runtime resizing
     _buffs.resize(numBuffers);
-    for (auto &buff : _buffs) buff.reserve(bufferLength*bytesPerSample);
-    for (auto &buff : _buffs) buff.resize(bufferLength*bytesPerSample);
+    for (auto &buff : _buffs) buff.reserve(bufferLength * bytesPerSample);
+    for (auto &buff : _buffs) buff.resize(bufferLength * bytesPerSample);
+
+    SoapySDR_logf(SOAPY_SDR_INFO, "SoapyAirspy stream: %zu buffers × %zu samples (%zu bytes each), format=%s",
+        numBuffers, bufferLength, bufferLength * bytesPerSample, format.c_str());
 
     return (SoapySDR::Stream *) this;
 }
@@ -192,6 +209,7 @@ int SoapyAirspy::activateStream(
     
     resetBuffer = true;
     bufferedElems = 0;
+    _overflowCount.store(0);
     
     if (sampleRateChanged.load()) {
         airspy_set_samplerate(dev, sampleRate);
@@ -221,11 +239,11 @@ int SoapyAirspy::readStream(
         long long &timeNs,
         const long timeoutUs)
 {    
-    if (!airspy_is_streaming(dev)) {
+    if (SDR_UNLIKELY(!airspy_is_streaming(dev))) {
         return 0;
     }
     
-    if (sampleRateChanged.load()) {
+    if (SDR_UNLIKELY(sampleRateChanged.load())) {
         airspy_stop_rx(dev);
         airspy_set_samplerate(dev, sampleRate);
         airspy_start_rx(dev, &_rx_callback, (void *) this);
@@ -233,7 +251,7 @@ int SoapyAirspy::readStream(
     }
 
     //this is the user's buffer for channel 0
-    void *buff0 = buffs[0];
+    char *buff0 = (char *)buffs[0];
 
     //are elements left in the buffer? if not, do a new read.
     if (bufferedElems == 0)
@@ -243,14 +261,15 @@ int SoapyAirspy::readStream(
         bufferedElems = ret;
     }
 
-    size_t returnedElems = std::min(bufferedElems, numElems);
+    const size_t returnedElems = std::min(bufferedElems, numElems);
+    const size_t returnedBytes = returnedElems * bytesPerSample;
 
-    //convert into user's buff0
-    std::memcpy(buff0, _currentBuff, returnedElems * bytesPerSample);
+    //copy into user's buff0
+    std::memcpy(buff0, _currentBuff, returnedBytes);
     
     //bump variables for next call into readStream
     bufferedElems -= returnedElems;
-    _currentBuff += returnedElems * bytesPerSample;
+    _currentBuff += returnedBytes;
 
     //return number of elements written to buff0
     if (bufferedElems != 0) flags |= SOAPY_SDR_MORE_FRAGMENTS;
@@ -292,10 +311,15 @@ int SoapyAirspy::acquireReadBuffer(
     }
 
     //handle overflow from the rx callback thread
+    //keep only the 2 newest buffers to minimize data loss
     if (_overflowEvent)
     {
-        //drain the old buffers from the fifo
-        _buf_head = (_buf_head + _buf_count.exchange(0)) % numBuffers;
+        const size_t cnt = _buf_count.load();
+        if (cnt > 2) {
+            const size_t toDrain = cnt - 2;
+            _buf_head = (_buf_head + toDrain) % numBuffers;
+            _buf_count -= toDrain;
+        }
         _overflowEvent = false;
         SoapySDR::log(SOAPY_SDR_SSI, "O");
         return SOAPY_SDR_OVERFLOW;

@@ -38,8 +38,17 @@
 
 #include <libairspy/airspy.h>
 
-#define DEFAULT_BUFFER_BYTES 262144
-#define DEFAULT_NUM_BUFFERS 8
+// Branch prediction hints for hot-path optimization
+#if defined(__GNUC__) || defined(__clang__)
+#define SDR_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define SDR_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define SDR_LIKELY(x)   (x)
+#define SDR_UNLIKELY(x) (x)
+#endif
+
+#define DEFAULT_BUFFER_BYTES 524288
+#define DEFAULT_NUM_BUFFERS 15
 #define MAX_DEVICES 32
 
 class SoapyAirspy: public SoapySDR::Device
@@ -213,10 +222,13 @@ private:
     uint32_t sampleRate, centerFrequency;
     unsigned int bufferLength;
     size_t numBuffers;
-    bool agcMode, streamActive, rfBias, bitPack;
+    bool agcMode, rfBias, bitPack;
+    std::atomic<bool> streamActive;
     std::atomic_bool sampleRateChanged;
     int bytesPerSample;
     uint8_t lnaGain, mixerGain, vgaGain;
+    uint8_t linearityGain, sensitivityGain;
+    double ppmCorrection;
     
 public:
     //async api usage
@@ -234,4 +246,6 @@ public:
     size_t bufferedElems;
     size_t _currentHandle;
     bool resetBuffer;
+    std::atomic<uint64_t> _overflowCount;
+    size_t _remainingElems;
 };
