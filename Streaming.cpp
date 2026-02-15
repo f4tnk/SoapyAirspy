@@ -166,7 +166,9 @@ SoapySDR::Stream *SoapyAirspy::setupStream(
     }
 
     //We get this many complex samples over the bus.
-    //Its the same for both complex float and int16.
+    //AirSpy delivers sample_count as number of I/Q pairs.
+    //reqBufferBytes / 4 gives sample count for both CS16 (4 bytes/sample)
+    //and CF32 (the actual buffer memory is bufferLength * bytesPerSample).
     bufferLength = reqBufferBytes / 4;
 
     //clear async fifo counts
@@ -212,10 +214,18 @@ int SoapyAirspy::activateStream(
     _overflowCount.store(0);
     
     if (sampleRateChanged.load()) {
-        airspy_set_samplerate(dev, sampleRate);
+        int ret = airspy_set_samplerate(dev, sampleRate);
+        if (ret != AIRSPY_SUCCESS) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_samplerate(%u) failed: %d", sampleRate, ret);
+        }
         sampleRateChanged.store(false);
     }
-    airspy_start_rx(dev, &_rx_callback, (void *) this);
+    int ret = airspy_start_rx(dev, &_rx_callback, (void *) this);
+    if (ret != AIRSPY_SUCCESS) {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_start_rx() failed: %d", ret);
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+    streamActive.store(true);
     
     return 0;
 }
@@ -245,8 +255,15 @@ int SoapyAirspy::readStream(
     
     if (SDR_UNLIKELY(sampleRateChanged.load())) {
         airspy_stop_rx(dev);
-        airspy_set_samplerate(dev, sampleRate);
-        airspy_start_rx(dev, &_rx_callback, (void *) this);
+        int ret = airspy_set_samplerate(dev, sampleRate);
+        if (ret != AIRSPY_SUCCESS) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_samplerate(%u) failed during readStream: %d", sampleRate, ret);
+        }
+        ret = airspy_start_rx(dev, &_rx_callback, (void *) this);
+        if (ret != AIRSPY_SUCCESS) {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_start_rx() failed during readStream: %d", ret);
+            return SOAPY_SDR_STREAM_ERROR;
+        }
         sampleRateChanged.store(false);
     }
 
