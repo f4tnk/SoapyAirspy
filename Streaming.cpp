@@ -28,6 +28,7 @@
 #include <algorithm> //min
 #include <climits> //SHRT_MAX
 #include <cstring> // memcpy
+#include <chrono>   // Mod 23: per-buffer timestamps
 
 
 std::vector<std::string> SoapyAirspy::getStreamFormats(const int direction, const size_t channel) const {
@@ -86,6 +87,12 @@ int SoapyAirspy::rx_callback(airspy_transfer *t)
         return 1;
     }
 
+    // Mod 24: skip new samples while main thread is draining stale data
+    // after a frequency retune (Doppler event). Avoids IQ glitch.
+    if (SDR_UNLIKELY(resetBuffer.load())) {
+        return 0;
+    }
+
     //overflow condition: the caller is not reading fast enough
     if (SDR_UNLIKELY(_buf_count == numBuffers))
     {
@@ -94,12 +101,17 @@ int SoapyAirspy::rx_callback(airspy_transfer *t)
         return 0;
     }
 
+    // Mod 23: stamp receive time before memcpy (monotonic clock, no wall-time drift)
+    const long long nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
     const size_t bytes = t->sample_count * bytesPerSample;
 
     //copy into the buffer queue
     auto &buff = _buffs[_buf_tail];
     buff.resize(bytes);
     std::memcpy(buff.data(), t->samples, bytes);
+    _buf_timestamps[_buf_tail] = nowNs;
 
     //increment the tail pointer
     _buf_tail = (_buf_tail + 1) % numBuffers;
@@ -182,6 +194,8 @@ SoapySDR::Stream *SoapyAirspy::setupStream(
     _buffs.resize(numBuffers);
     for (auto &buff : _buffs) buff.reserve(bufferLength * bytesPerSample);
     for (auto &buff : _buffs) buff.resize(bufferLength * bytesPerSample);
+    // Mod 23: allocate parallel timestamp array
+    _buf_timestamps.assign(numBuffers, 0LL);
 
     SoapySDR_logf(SOAPY_SDR_INFO, "SoapyAirspy stream: %zu buffers × %zu samples (%zu bytes each), format=%s",
         numBuffers, bufferLength, bufferLength * bytesPerSample, format.c_str());
@@ -209,9 +223,11 @@ int SoapyAirspy::activateStream(
         return SOAPY_SDR_NOT_SUPPORTED;
     }
     
-    resetBuffer = true;
+    resetBuffer.store(true);
     bufferedElems = 0;
     _overflowCount.store(0);
+    // Mod 23: reset timestamps
+    std::fill(_buf_timestamps.begin(), _buf_timestamps.end(), 0LL);
     
     if (sampleRateChanged.load()) {
         int ret = airspy_set_samplerate(dev, sampleRate);
@@ -319,11 +335,13 @@ int SoapyAirspy::acquireReadBuffer(
 {
     //reset is issued by various settings
     //to drain old data out of the queue
-    if (resetBuffer)
+    // Mod 22: use atomic load() for thread-safe check
+    if (resetBuffer.load())
     {
         //drain all buffers from the fifo
         _buf_head = (_buf_head + _buf_count.exchange(0)) % numBuffers;
-        resetBuffer = false;
+        // Mod 24: allow rx_callback to resume writing after drain
+        resetBuffer.store(false);
         _overflowEvent = false;
     }
 
@@ -354,6 +372,8 @@ int SoapyAirspy::acquireReadBuffer(
     handle = _buf_head;
     _buf_head = (_buf_head + 1) % numBuffers;
     buffs[0] = (void *)_buffs[handle].data();
+    // Mod 23: return precise receive timestamp to caller (gr-satnogs Doppler)
+    timeNs = _buf_timestamps[handle];
     flags = 0;
 
     //return number available

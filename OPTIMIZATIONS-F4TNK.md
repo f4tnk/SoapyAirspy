@@ -5,7 +5,7 @@
 [![AirSpy R2](https://img.shields.io/badge/hardware-AirSpy%20R2-orange)]()
 [![SoapySDR](https://img.shields.io/badge/middleware-SoapySDR-purple)]()
 
-> **21 targeted optimizations** to the SoapySDR wrapper for AirSpy R2,
+> **27 targeted optimizations** to the SoapySDR wrapper for AirSpy R2,
 > focused on **weak-signal satellite reception** (SatNOGS, APRS, AIS, telemetry).
 >
 > These changes sit between the application layer (GNU Radio, SDR++) and the
@@ -23,9 +23,11 @@
 6. [Overflow Handling](#5--overflow-handling)
 7. [Compiler & Build](#6--compiler--build)
 8. [Thread Safety & Branch Prediction](#7--thread-safety--branch-prediction)
-9. [Complete Optimization Table](#complete-optimization-table)
-10. [Build Instructions](#build-instructions)
-11. [Usage Examples](#usage-examples)
+9. [Doppler & Real-time Reliability](#8--doppler--real-time-reliability)
+10. [Diagnostics & Observability](#9--diagnostics--observability)
+11. [Complete Optimization Table](#complete-optimization-table)
+12. [Build Instructions](#build-instructions)
+13. [Usage Examples](#usage-examples)
 
 ---
 
@@ -385,6 +387,124 @@ if (SDR_UNLIKELY(_buf_count == numBuffers)) { ... }
 
 ---
 
+## 8. 🛰️ Doppler & Real-time Reliability
+
+### Problem
+
+During LEO satellite passes, the ground station performs up to **10 Doppler retunings per minute**.
+The original code had three related correctness/quality issues:
+
+1. `resetBuffer` was a plain `bool` shared between the main thread (`setFrequency`) and the
+   USB callback thread — a **data race** (undefined behaviour per C++11).
+2. After a frequency retune, stale IQ samples from the previous frequency were still enqueued
+   into the ring buffer, causing **transient frame-decoder desyncs**.
+3. `acquireReadBuffer()` never filled the `timeNs` output parameter — receivers had **no
+   per-buffer timestamp**, preventing gr-satnogs from aligning Doppler correction in time.
+
+### Solution
+
+```mermaid
+sequenceDiagram
+    participant Main as Main thread<br/>(setFrequency)
+    participant HW as AirSpy hardware
+    participant CB as rx_callback thread
+    participant GR as GNU Radio / gr-satnogs
+
+    Main->>HW: airspy_set_freq(newFreq)
+    Main->>resetBuffer: store(true) [atomic]
+    CB->>resetBuffer: load() → true → skip buffer & return 0
+    Note over CB: stale IQ samples discarded
+    GR->>resetBuffer: load() in acquireReadBuffer → true → flush head
+    GR->>resetBuffer: store(false) [atomic]
+    CB->>CB: timestamp = steady_clock::now()
+    CB->>ring: enqueue IQ + timestamp
+    GR->>GR: timeNs = _buf_timestamps[handle]
+```
+
+| Mod | What changed | Files |
+|-----|-------------|-------|
+| **22** | `bool resetBuffer` → `std::atomic<bool>` — eliminates data race | `SoapyAirspy.hpp`, `Settings.cpp`, `Streaming.cpp` |
+| **23** | `std::vector<long long> _buf_timestamps` — per-buffer `steady_clock` nanosecond timestamps propagated to `timeNs` in `acquireReadBuffer` | `SoapyAirspy.hpp`, `Streaming.cpp` |
+| **24** | `rx_callback`: early `return 0` when `resetBuffer.load()` is true — discards stale IQ at retune | `Streaming.cpp` |
+| **25** | `setSampleRate()` snaps requested rate to nearest supported hardware rate, logs a warning if snapped — prevents silent wrong-rate failures | `Settings.cpp` |
+
+```c++
+// Mod 22 — atomic eliminates UB
+std::atomic<bool> resetBuffer;
+
+// Mod 23 — nanosecond receive timestamp
+const long long nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+_buf_timestamps[_buf_tail] = nowNs;
+// ... in acquireReadBuffer:
+timeNs = _buf_timestamps[handle];
+
+// Mod 24 — discard stale IQ during Doppler retune
+if (SDR_UNLIKELY(self->resetBuffer.load())) return 0;
+
+// Mod 25 — snap to nearest supported rate
+const auto rates = listSampleRates(SOAPY_SDR_RX, 0);
+auto it = std::min_element(rates.begin(), rates.end(), [&](double a, double b){
+    return std::abs(a - rate) < std::abs(b - rate);
+});
+if (it != rates.end() && std::abs(*it - rate) > 1.0) {
+    SoapySDR_logf(SOAPY_SDR_WARNING,
+        "AirSpy: requested %.0f MSPS → snapped to %.0f MSPS",
+        rate/1e6, (*it)/1e6);
+    rate = *it;
+}
+```
+
+**Files:** `SoapyAirspy.hpp`, `Streaming.cpp`, `Settings.cpp`
+
+---
+
+## 9. 📊 Diagnostics & Observability
+
+### Problem
+
+Operators running a SatNOGS ground station had no way to:
+- Know whether the **F4TNK firmware** (with its custom gain tables) was loaded vs stock firmware.
+- **Monitor buffer overflow counts** from the GNU Radio flowgraph or SatNOGS client without
+  custom instrumentation.
+
+### Solution
+
+| Mod | What changed | Files |
+|-----|-------------|-------|
+| **26** | `readSetting("overflow_count")` returns `_overflowCount.load()` as a string; `getSettingInfo()` advertises it as a read-only INT setting | `Settings.cpp` |
+| **27** | `getHardwareInfo()` calls `airspy_version_string_read()` and stores the result in `args["firmware"]` — visible in `SoapySDRUtil --probe` | `Settings.cpp` |
+
+```c++
+// Mod 26 — read overflow counter from Python / GR
+// In Python:
+// count = sdr.readSetting("overflow_count")
+
+// Mod 27 — firmware version in --probe output
+char fw_version[128] = {};
+if (airspy_version_string_read(dev, fw_version, sizeof(fw_version)) == AIRSPY_SUCCESS)
+    args["firmware"] = fw_version;
+else
+    args["firmware"] = "unknown";
+```
+
+```bash
+# Usage: probe the device and check firmware
+SoapySDRUtil --probe="driver=airspy"
+# → hardware: firmware=airspy_ver_1.0.0-rc10-6-g4044438
+
+# Read overflow count from Python:
+python3 -c "
+import SoapySDR
+sdr = SoapySDR.Device({'driver':'airspy'})
+print('overflows:', sdr.readSetting('overflow_count'))
+"
+```
+
+**Files:** `Settings.cpp`
+
+---
+
 ## Complete Optimization Table
 
 | # | Category | Optimization | File(s) |
@@ -412,6 +532,12 @@ if (SDR_UNLIKELY(_buf_count == numBuffers)) { ... }
 | 21 | Build | `-march=native -ffast-math -ftree-vectorize -flto` | `CMakeLists.txt` |
 | — | Safety | `std::atomic<bool> streamActive` | `SoapyAirspy.hpp` |
 | — | Perf | `SDR_LIKELY` / `SDR_UNLIKELY` branch hints | `SoapyAirspy.hpp`, `Streaming.cpp` |
+| 22 | Thread Safety | `bool resetBuffer` → `std::atomic<bool>` — eliminates data race on Doppler retune | `SoapyAirspy.hpp`, `Settings.cpp`, `Streaming.cpp` |
+| 23 | Timestamps | `_buf_timestamps[]` — per-buffer `steady_clock` ns, propagated to `timeNs` | `SoapyAirspy.hpp`, `Streaming.cpp` |
+| 24 | Doppler | Skip stale IQ in `rx_callback` during `resetBuffer` — no retune glitch | `Streaming.cpp` |
+| 25 | Sample Rate | Snap to nearest supported rate + log warning | `Settings.cpp` |
+| 26 | Diagnostics | `readSetting("overflow_count")` — expose `_overflowCount` to gr-satnogs | `Settings.cpp` |
+| 27 | Observability | `getHardwareInfo()` — `airspy_version_string_read()` → `args["firmware"]` | `Settings.cpp` |
 
 ---
 
@@ -522,7 +648,7 @@ graph TB
 
 | Repository | Description |
 |---|---|
-| [airspyone_host (F4TNK)](https://github.com/f4tnk/airspyone_host/tree/master-f4tnk) | Optimized libairspy driver (24 optimizations) |
+| [airspyone_host (F4TNK)](https://github.com/f4tnk/airspyone_host/tree/master-f4tnk) | Optimized libairspy driver (32 optimizations) |
 | [SoapyAirspy (F4TNK)](https://github.com/f4tnk/SoapyAirspy/tree/master-f4tnk) | This repository — SoapySDR wrapper optimizations |
 | [gr-satnogs (F4TNK)](https://gitlab.com/f4tnk/gr-satnogs) | GNU Radio SatNOGS blocks |
 | [satnogs-flowgraphs (F4TNK)](https://gitlab.com/f4tnk/satnogs-flowgraphs) | Optimized satellite flowgraphs |

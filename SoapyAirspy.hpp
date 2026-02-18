@@ -229,6 +229,9 @@ private:
     uint8_t lnaGain, mixerGain, vgaGain;
     uint8_t linearityGain, sensitivityGain;
     double ppmCorrection;
+    // Mod 22: atomic resetBuffer — eliminates data race between main thread
+    // (setFrequency) and USB callback thread on Doppler retuning events
+    std::atomic<bool> resetBuffer;
     
 public:
     //async api usage
@@ -238,6 +241,9 @@ public:
     std::condition_variable _buf_cond;
 
     std::vector<std::vector<char> > _buffs;
+    // Mod 23: per-buffer receive timestamps for precise timeNs reporting
+    // used by gr-satnogs Doppler correction and post-pass analysis
+    std::vector<long long> _buf_timestamps;
     size_t	_buf_head;
     size_t	_buf_tail;
     std::atomic<size_t>	_buf_count;
@@ -245,7 +251,5 @@ public:
     std::atomic<bool> _overflowEvent;
     size_t bufferedElems;
     size_t _currentHandle;
-    bool resetBuffer;
     std::atomic<uint64_t> _overflowCount;
-    size_t _remainingElems;
 };

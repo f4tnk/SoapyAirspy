@@ -37,7 +37,8 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
     bitPack = true;
 
     bufferedElems = 0;
-    resetBuffer = false;
+    // Mod 22: resetBuffer is std::atomic<bool> — use store() for explicit atomic write
+    resetBuffer.store(false);
 
     streamActive = false;
     sampleRateChanged.store(false);
@@ -124,6 +125,14 @@ SoapySDR::Kwargs SoapyAirspy::getHardwareInfo(void) const
     serialstr.str("");
     serialstr << std::hex << serial;
     args["serial"] = serialstr.str();
+
+    // Mod 27: expose firmware version string for F4TNK detection in SatNOGS
+    // airspy_version_string_read returns e.g. "AirSpy NOS 88e4bd6 2026-02-18"
+    char fw_version[40] = {};
+    if (airspy_version_string_read(dev, fw_version, sizeof(fw_version)) == AIRSPY_SUCCESS)
+        args["firmware"] = std::string(fw_version);
+    else
+        args["firmware"] = "unknown";
 
     return args;
 }
@@ -271,7 +280,8 @@ void SoapyAirspy::setFrequency(
     if (name == "RF")
     {
         centerFrequency = (uint32_t) frequency;
-        resetBuffer = true;
+        // Mod 22: atomic store — safe from USB callback thread
+        resetBuffer.store(true);
         //apply PPM correction to compensate crystal oscillator drift
         const uint32_t corrected = (uint32_t)(frequency * (1.0 + ppmCorrection / 1e6));
         SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting center freq: %u (corrected: %u, PPM: %.1f)", centerFrequency, corrected, ppmCorrection);
@@ -324,11 +334,31 @@ SoapySDR::ArgInfoList SoapyAirspy::getFrequencyArgsInfo(const int direction, con
 
 void SoapyAirspy::setSampleRate(const int direction, const size_t channel, const double rate)
 {
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting sample rate: %d", sampleRate);
+    // Mod 25: snap requested rate to nearest hardware-supported value
+    // prevents silent failures when gr-satnogs requests e.g. 2.4 MSPS
+    const auto supported = this->listSampleRates(direction, channel);
+    double snapped = rate;
+    if (!supported.empty())
+    {
+        snapped = supported[0];
+        double bestDiff = std::abs(rate - supported[0]);
+        for (const auto r : supported)
+        {
+            const double diff = std::abs(rate - r);
+            if (diff < bestDiff) { bestDiff = diff; snapped = r; }
+        }
+        if (snapped != rate)
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                "SoapyAirspy: requested rate %.0f Hz not supported, snapped to %.0f Hz",
+                rate, snapped);
+    }
 
-    if (sampleRate != rate) {
-        sampleRate = rate;
-        resetBuffer = true;
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting sample rate: %.0f", snapped);
+
+    if (sampleRate != (uint32_t)snapped) {
+        sampleRate = (uint32_t)snapped;
+        // Mod 22: atomic store
+        resetBuffer.store(true);
         sampleRateChanged.store(true);
     }
 }
@@ -431,6 +461,15 @@ SoapySDR::ArgInfoList SoapyAirspy::getSettingInfo(void) const
     sensGainArg.range = SoapySDR::Range(0, 21);
     setArgs.push_back(sensGainArg);
 
+    // Mod 26: overflow_count — read-only diagnostic (writable key ignored)
+    SoapySDR::ArgInfo overflowArg;
+    overflowArg.key = "overflow_count";
+    overflowArg.value = "0";
+    overflowArg.name = "Overflow Count";
+    overflowArg.description = "Number of USB buffer overflow events since last activateStream(). Poll to detect frame loss in gr-satnogs.";
+    overflowArg.type = SoapySDR::ArgInfo::INT;
+    setArgs.push_back(overflowArg);
+
     return setArgs;
 }
 
@@ -488,6 +527,11 @@ std::string SoapyAirspy::readSetting(const std::string &key) const
     }
     if (key == "sensitivity_gain") {
         return std::to_string(sensitivityGain);
+    }
+    // Mod 26: expose overflow counter via SoapySDR settings API
+    // gr-satnogs / GNU Radio flowgraphs can poll this to detect buffer loss
+    if (key == "overflow_count") {
+        return std::to_string(_overflowCount.load());
     }
     return "";
 }
