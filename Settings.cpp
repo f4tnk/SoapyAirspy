@@ -80,20 +80,29 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
         }
     }
 
-    //apply arguments to settings when they match
+    //program hardware with optimized defaults first
+    airspy_set_lna_gain(dev, lnaGain);
+    airspy_set_mixer_gain(dev, mixerGain);
+    airspy_set_vga_gain(dev, vgaGain);
+    airspy_set_packing(dev, bitPack ? 1 : 0);
+
+    //apply arguments to settings — may override the defaults above
     for (const auto &info : this->getSettingInfo())
     {
         const auto it = args.find(info.key);
         if (it != args.end()) this->writeSetting(it->first, it->second);
     }
 
-    //program hardware with optimized defaults
-    airspy_set_lna_gain(dev, lnaGain);
-    airspy_set_mixer_gain(dev, mixerGain);
-    airspy_set_vga_gain(dev, vgaGain);
-    airspy_set_packing(dev, bitPack ? 1 : 0);
-    SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy defaults: LNA=%d MIX=%d VGA=%d packing=%s",
-        lnaGain, mixerGain, vgaGain, bitPack ? "on" : "off");
+    //log actual final state after all args applied
+    if (sensitivityGain > 0)
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy active: sensitivity_gain=%d packing=%s",
+            sensitivityGain, bitPack ? "on" : "off");
+    else if (linearityGain > 0)
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy active: linearity_gain=%d packing=%s",
+            linearityGain, bitPack ? "on" : "off");
+    else
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy active: LNA=%d MIX=%d VGA=%d packing=%s",
+            lnaGain, mixerGain, vgaGain, bitPack ? "on" : "off");
 }
 
 SoapyAirspy::~SoapyAirspy(void)
@@ -226,16 +235,19 @@ void SoapyAirspy::setGain(const int direction, const size_t channel, const std::
     {
         lnaGain = uint8_t(value);
         airspy_set_lna_gain(dev, lnaGain);
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy gain: LNA=%d MIX=%d VGA=%d", lnaGain, mixerGain, vgaGain);
     }
     else if (name == "MIX")
     {
         mixerGain = uint8_t(value);
         airspy_set_mixer_gain(dev, mixerGain);
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy gain: LNA=%d MIX=%d VGA=%d", lnaGain, mixerGain, vgaGain);
     }
     else if (name == "VGA")
     {
         vgaGain = uint8_t(value);
         airspy_set_vga_gain(dev, vgaGain);
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy gain: LNA=%d MIX=%d VGA=%d", lnaGain, mixerGain, vgaGain);
     }
 }
 
