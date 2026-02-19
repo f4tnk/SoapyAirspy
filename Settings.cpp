@@ -24,6 +24,7 @@
 
 #include "SoapyAirspy.hpp"
 #include <cinttypes>
+#include <cstdio>
 
 SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
 {
@@ -96,7 +97,7 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
     //log firmware version + available sample rates at init
     char fw_ver[40] = {};
     if (airspy_version_string_read(dev, fw_ver, sizeof(fw_ver)) == AIRSPY_SUCCESS)
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy firmware: %s", fw_ver);
+        fprintf(stderr, "SoapyAirspy | firmware: %s\n", fw_ver);
 
     const auto rates = this->listSampleRates(SOAPY_SDR_RX, 0);
     std::string ratesStr;
@@ -104,7 +105,7 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
         if (i > 0) ratesStr += ", ";
         ratesStr += std::to_string((unsigned)(rates[i] / 1e6)) + " MSPS";
     }
-    SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy sample rates: %s", ratesStr.c_str());
+    fprintf(stderr, "SoapyAirspy | sample rates: %s\n", ratesStr.c_str());
 
     //log initial defaults (will be overridden by SatNOGS setGain calls)
     SoapySDR_logf(SOAPY_SDR_DEBUG, "AirSpy defaults: LNA=%d MIX=%d VGA=%d packing=%s bias=%s",
@@ -300,7 +301,7 @@ void SoapyAirspy::setFrequency(
         resetBuffer.store(true);
         //apply PPM correction to compensate crystal oscillator drift
         const uint32_t corrected = (uint32_t)(frequency * (1.0 + ppmCorrection / 1e6));
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy tune: %.6f MHz (PPM: %+.1f)",
+        fprintf(stderr, "SoapyAirspy | tune: %.6f MHz (PPM: %+.1f)\n",
             corrected / 1e6, ppmCorrection);
         airspy_set_freq(dev, corrected);
     }
@@ -510,21 +511,21 @@ void SoapyAirspy::writeSetting(const std::string &key, const std::string &value)
             const uint32_t corrected = (uint32_t)(centerFrequency * (1.0 + ppmCorrection / 1e6));
             airspy_set_freq(dev, corrected);
         }
-        SoapySDR_logf(SOAPY_SDR_INFO, "PPM correction set to %.2f", ppmCorrection);
+        fprintf(stderr, "SoapyAirspy | PPM correction: %.2f ppm\n", ppmCorrection);
     }
     else if (key == "linearity_gain") {
         try { linearityGain = uint8_t(std::stoi(value)); }
         catch (...) { linearityGain = 0; }
         if (linearityGain > 21) linearityGain = 21;
         airspy_set_linearity_gain(dev, linearityGain);
-        SoapySDR_logf(SOAPY_SDR_INFO, "Linearity gain set to %d", linearityGain);
+        fprintf(stderr, "SoapyAirspy | linearity gain: %d\n", linearityGain);
     }
     else if (key == "sensitivity_gain") {
         try { sensitivityGain = uint8_t(std::stoi(value)); }
         catch (...) { sensitivityGain = 0; }
         if (sensitivityGain > 21) sensitivityGain = 21;
         airspy_set_sensitivity_gain(dev, sensitivityGain);
-        SoapySDR_logf(SOAPY_SDR_INFO, "Sensitivity gain set to %d", sensitivityGain);
+        fprintf(stderr, "SoapyAirspy | sensitivity gain: %d\n", sensitivityGain);
     }
 }
 

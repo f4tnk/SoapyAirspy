@@ -24,6 +24,7 @@
 
 #include "SoapyAirspy.hpp"
 #include <SoapySDR/Logger.hpp>
+#include <cstdio>
 #include <SoapySDR/Formats.hpp>
 #include <algorithm> //min
 #include <climits> //SHRT_MAX
@@ -197,8 +198,8 @@ SoapySDR::Stream *SoapyAirspy::setupStream(
     // Mod 23: allocate parallel timestamp array
     _buf_timestamps.assign(numBuffers, 0LL);
 
-    SoapySDR_logf(SOAPY_SDR_INFO, "SoapyAirspy stream: %zu buffers × %zu samples (%zu bytes each), format=%s",
-        numBuffers, bufferLength, bufferLength * bytesPerSample, format.c_str());
+    fprintf(stderr, "SoapyAirspy | stream: %zu buffers \xc3\x97 %u samples (%u bytes each), format=%s\n",
+        numBuffers, bufferLength, bufferLength * (unsigned)bytesPerSample, format.c_str());
 
     return (SoapySDR::Stream *) this;
 }
@@ -247,18 +248,18 @@ int SoapyAirspy::activateStream(
     char fw_ver[40] = {};
     airspy_version_string_read(dev, fw_ver, sizeof(fw_ver));
     if (sensitivityGain > 0)
-        SoapySDR_logf(SOAPY_SDR_INFO,
-            "AirSpy streaming: %.6f MHz @ %.1f MSPS | sensitivity=%d | packing=%s bias=%s PPM=%+.1f | %s",
+        fprintf(stderr,
+            "SoapyAirspy | streaming: %.6f MHz @ %.1f MSPS | sensitivity=%d | packing=%s bias=%s PPM=%+.1f | %s\n",
             centerFrequency / 1e6, sampleRate / 1e6, sensitivityGain,
             bitPack ? "on" : "off", rfBias ? "on" : "off", ppmCorrection, fw_ver);
     else if (linearityGain > 0)
-        SoapySDR_logf(SOAPY_SDR_INFO,
-            "AirSpy streaming: %.6f MHz @ %.1f MSPS | linearity=%d | packing=%s bias=%s PPM=%+.1f | %s",
+        fprintf(stderr,
+            "SoapyAirspy | streaming: %.6f MHz @ %.1f MSPS | linearity=%d | packing=%s bias=%s PPM=%+.1f | %s\n",
             centerFrequency / 1e6, sampleRate / 1e6, linearityGain,
             bitPack ? "on" : "off", rfBias ? "on" : "off", ppmCorrection, fw_ver);
     else
-        SoapySDR_logf(SOAPY_SDR_INFO,
-            "AirSpy streaming: %.6f MHz @ %.1f MSPS | LNA=%d MIX=%d VGA=%d | packing=%s bias=%s PPM=%+.1f | %s",
+        fprintf(stderr,
+            "SoapyAirspy | streaming: %.6f MHz @ %.1f MSPS | LNA=%d MIX=%d VGA=%d | packing=%s bias=%s PPM=%+.1f | %s\n",
             centerFrequency / 1e6, sampleRate / 1e6, lnaGain, mixerGain, vgaGain,
             bitPack ? "on" : "off", rfBias ? "on" : "off", ppmCorrection, fw_ver);
 
@@ -275,9 +276,9 @@ int SoapyAirspy::deactivateStream(SoapySDR::Stream *stream, const int flags, con
 
     const auto overflows = _overflowCount.load();
     if (overflows > 0)
-        SoapySDR_logf(SOAPY_SDR_WARNING, "AirSpy session ended: %zu USB overflow(s) detected", overflows);
+        SoapySDR_logf(SOAPY_SDR_WARNING, "SoapyAirspy | session ended: %zu USB overflow(s) detected", overflows);
     else
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy session ended: 0 overflows");
+        fprintf(stderr, "SoapyAirspy | session ended: 0 overflows\n");
     
     return 0;
 }
