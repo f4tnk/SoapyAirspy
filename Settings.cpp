@@ -93,16 +93,22 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
         if (it != args.end()) this->writeSetting(it->first, it->second);
     }
 
-    //log actual final state after all args applied
-    if (sensitivityGain > 0)
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy active: sensitivity_gain=%d packing=%s",
-            sensitivityGain, bitPack ? "on" : "off");
-    else if (linearityGain > 0)
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy active: linearity_gain=%d packing=%s",
-            linearityGain, bitPack ? "on" : "off");
-    else
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy active: LNA=%d MIX=%d VGA=%d packing=%s",
-            lnaGain, mixerGain, vgaGain, bitPack ? "on" : "off");
+    //log firmware version + available sample rates at init
+    char fw_ver[40] = {};
+    if (airspy_version_string_read(dev, fw_ver, sizeof(fw_ver)) == AIRSPY_SUCCESS)
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy firmware: %s", fw_ver);
+
+    const auto rates = this->listSampleRates(SOAPY_SDR_RX, 0);
+    std::string ratesStr;
+    for (size_t i = 0; i < rates.size(); i++) {
+        if (i > 0) ratesStr += ", ";
+        ratesStr += std::to_string((unsigned)(rates[i] / 1e6)) + " MSPS";
+    }
+    SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy sample rates: %s", ratesStr.c_str());
+
+    //log initial defaults (will be overridden by SatNOGS setGain calls)
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "AirSpy defaults: LNA=%d MIX=%d VGA=%d packing=%s bias=%s",
+        lnaGain, mixerGain, vgaGain, bitPack ? "on" : "off", rfBias ? "on" : "off");
 }
 
 SoapyAirspy::~SoapyAirspy(void)
@@ -235,20 +241,18 @@ void SoapyAirspy::setGain(const int direction, const size_t channel, const std::
     {
         lnaGain = uint8_t(value);
         airspy_set_lna_gain(dev, lnaGain);
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy gain: LNA=%d MIX=%d VGA=%d", lnaGain, mixerGain, vgaGain);
     }
     else if (name == "MIX")
     {
         mixerGain = uint8_t(value);
         airspy_set_mixer_gain(dev, mixerGain);
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy gain: LNA=%d MIX=%d VGA=%d", lnaGain, mixerGain, vgaGain);
     }
     else if (name == "VGA")
     {
         vgaGain = uint8_t(value);
         airspy_set_vga_gain(dev, vgaGain);
-        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy gain: LNA=%d MIX=%d VGA=%d", lnaGain, mixerGain, vgaGain);
     }
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "AirSpy setGain: %s=%d", name.c_str(), (int)value);
 }
 
 double SoapyAirspy::getGain(const int direction, const size_t channel, const std::string &name) const
@@ -296,7 +300,8 @@ void SoapyAirspy::setFrequency(
         resetBuffer.store(true);
         //apply PPM correction to compensate crystal oscillator drift
         const uint32_t corrected = (uint32_t)(frequency * (1.0 + ppmCorrection / 1e6));
-        SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting center freq: %u (corrected: %u, PPM: %.1f)", centerFrequency, corrected, ppmCorrection);
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy tune: %.6f MHz (PPM: %+.1f)",
+            corrected / 1e6, ppmCorrection);
         airspy_set_freq(dev, corrected);
     }
 }

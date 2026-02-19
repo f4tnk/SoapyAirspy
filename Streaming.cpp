@@ -242,7 +242,26 @@ int SoapyAirspy::activateStream(
         return SOAPY_SDR_STREAM_ERROR;
     }
     streamActive.store(true);
-    
+
+    //log final SatNOGS configuration at stream start — this is THE authoritative config
+    char fw_ver[40] = {};
+    airspy_version_string_read(dev, fw_ver, sizeof(fw_ver));
+    if (sensitivityGain > 0)
+        SoapySDR_logf(SOAPY_SDR_INFO,
+            "AirSpy streaming: %.6f MHz @ %.1f MSPS | sensitivity=%d | packing=%s bias=%s PPM=%+.1f | %s",
+            centerFrequency / 1e6, sampleRate / 1e6, sensitivityGain,
+            bitPack ? "on" : "off", rfBias ? "on" : "off", ppmCorrection, fw_ver);
+    else if (linearityGain > 0)
+        SoapySDR_logf(SOAPY_SDR_INFO,
+            "AirSpy streaming: %.6f MHz @ %.1f MSPS | linearity=%d | packing=%s bias=%s PPM=%+.1f | %s",
+            centerFrequency / 1e6, sampleRate / 1e6, linearityGain,
+            bitPack ? "on" : "off", rfBias ? "on" : "off", ppmCorrection, fw_ver);
+    else
+        SoapySDR_logf(SOAPY_SDR_INFO,
+            "AirSpy streaming: %.6f MHz @ %.1f MSPS | LNA=%d MIX=%d VGA=%d | packing=%s bias=%s PPM=%+.1f | %s",
+            centerFrequency / 1e6, sampleRate / 1e6, lnaGain, mixerGain, vgaGain,
+            bitPack ? "on" : "off", rfBias ? "on" : "off", ppmCorrection, fw_ver);
+
     return 0;
 }
 
@@ -253,6 +272,12 @@ int SoapyAirspy::deactivateStream(SoapySDR::Stream *stream, const int flags, con
     airspy_stop_rx(dev);
     
     streamActive = false;
+
+    const auto overflows = _overflowCount.load();
+    if (overflows > 0)
+        SoapySDR_logf(SOAPY_SDR_WARNING, "AirSpy session ended: %zu USB overflow(s) detected", overflows);
+    else
+        SoapySDR_logf(SOAPY_SDR_INFO, "AirSpy session ended: 0 overflows");
     
     return 0;
 }
