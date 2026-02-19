@@ -212,6 +212,26 @@ public:
 
     std::string readSetting(const std::string &key) const;
 
+    /*******************************************************************
+     * Clock Source API — F4TNK GPSDO support
+     ******************************************************************/
+
+    std::vector<std::string> listClockSources(void) const;
+
+    void setClockSource(const std::string &source);
+
+    std::string getClockSource(void) const;
+
+    /*******************************************************************
+     * Sensor API — F4TNK GPSDO + PLL diagnostics
+     ******************************************************************/
+
+    std::vector<std::string> listSensors(void) const;
+
+    SoapySDR::ArgInfo getSensorInfo(const std::string &key) const;
+
+    std::string readSensor(const std::string &key) const;
+
 private:
 
     //device handle

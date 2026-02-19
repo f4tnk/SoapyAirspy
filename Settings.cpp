@@ -110,6 +110,39 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
     //log initial defaults (will be overridden by SatNOGS setGain calls)
     SoapySDR_logf(SOAPY_SDR_DEBUG, "AirSpy defaults: LNA=%d MIX=%d VGA=%d packing=%s bias=%s",
         lnaGain, mixerGain, vgaGain, bitPack ? "on" : "off", rfBias ? "on" : "off");
+
+    //log GPSDO / SI5351C clock reference status at init
+    {
+        uint8_t reg0 = 0xFF, reg15 = 0;
+        const bool r0_ok = (airspy_si5351c_read(dev, 0, &reg0) == AIRSPY_SUCCESS);
+        const bool r15_ok = (airspy_si5351c_read(dev, 15, &reg15) == AIRSPY_SUCCESS);
+
+        if (r0_ok && r15_ok) {
+            const bool gpsdo_signal = !(reg0 & 0x10);  // LOS_CLKIN: 0=present
+            const bool pll_a_lock = !(reg0 & 0x20);    // LOL_A: 0=locked
+            const bool pll_b_lock = !(reg0 & 0x40);    // LOL_B: 0=locked
+            const bool sys_init = !!(reg0 & 0x80);     // SYS_INIT: 1=initializing
+            const bool plla_clkin = !!(reg15 & 0x04);   // PLLA_SRC: 1=CLKIN
+            const bool pllb_clkin = !!(reg15 & 0x08);   // PLLB_SRC: 1=CLKIN
+
+            fprintf(stderr, "SoapyAirspy | SI5351C status: reg0=0x%02X reg15=0x%02X\n", reg0, reg15);
+            fprintf(stderr, "SoapyAirspy | 🔧 Clock source: PLL_A=%s, PLL_B=%s\n",
+                plla_clkin ? "CLKIN (GPSDO)" : "XTAL (internal)",
+                pllb_clkin ? "CLKIN (GPSDO)" : "XTAL (internal)");
+
+            if (gpsdo_signal) {
+                fprintf(stderr, "SoapyAirspy | ✅ GPSDO: Signal detected on CLKIN\n");
+            } else {
+                fprintf(stderr, "SoapyAirspy | ⚠️  GPSDO: No signal on CLKIN (LOS_CLKIN=1)\n");
+            }
+            fprintf(stderr, "SoapyAirspy | 🔒 PLL Lock: A=%s B=%s%s\n",
+                pll_a_lock ? "LOCKED" : "UNLOCKED",
+                pll_b_lock ? "LOCKED" : "UNLOCKED",
+                sys_init ? " (SYS_INIT in progress)" : "");
+        } else {
+            fprintf(stderr, "SoapyAirspy | ⚠️  SI5351C register read failed (no GPSDO diagnostics)\n");
+        }
+    }
 }
 
 SoapyAirspy::~SoapyAirspy(void)
@@ -551,5 +584,125 @@ std::string SoapyAirspy::readSetting(const std::string &key) const
     if (key == "overflow_count") {
         return std::to_string(_overflowCount.load());
     }
+    return "";
+}
+
+/*******************************************************************
+ * Clock Source API — F4TNK GPSDO support
+ * SI5351C register map:
+ *   Reg 0  — Device Status: bit4=LOS_CLKIN, bit5=LOL_A, bit6=LOL_B, bit7=SYS_INIT
+ *   Reg 15 — PLL Input Source: bit2=PLLA_SRC, bit3=PLLB_SRC (0=XTAL, 1=CLKIN)
+ ******************************************************************/
+
+std::vector<std::string> SoapyAirspy::listClockSources(void) const
+{
+    return {"internal", "external"};
+}
+
+void SoapyAirspy::setClockSource(const std::string &source)
+{
+    // SI5351C PLL source is configured by firmware at boot.
+    // Changing it at runtime requires reprogramming PLL registers
+    // which would glitch the ADC clock — log warning only.
+    if (source == "external") {
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+            "GPSDO external clock source must be configured in firmware (SI5351C reg 15). "
+            "Connect GPSDO to CLKIN before power-on.");
+    }
+}
+
+std::string SoapyAirspy::getClockSource(void) const
+{
+    uint8_t reg15 = 0;
+    if (airspy_si5351c_read(dev, 15, &reg15) != AIRSPY_SUCCESS) {
+        return "unknown";
+    }
+    // Bit 2: PLLA_SRC — 0=XTAL (internal), 1=CLKIN (external/GPSDO)
+    return (reg15 & 0x04) ? "external" : "internal";
+}
+
+/*******************************************************************
+ * Sensor API — F4TNK GPSDO + PLL diagnostics
+ * Reads SI5351C Device Status Register (reg 0) via USB I2C bridge:
+ *   Bit 7: SYS_INIT  (1 = system initializing)
+ *   Bit 6: LOL_B     (1 = PLL B lost lock)
+ *   Bit 5: LOL_A     (1 = PLL A lost lock)
+ *   Bit 4: LOS_CLKIN (1 = no signal on CLKIN pin → no GPSDO)
+ *   Bit 1:0: REVID   (chip revision)
+ ******************************************************************/
+
+std::vector<std::string> SoapyAirspy::listSensors(void) const
+{
+    return {"gpsdo_locked", "pll_a_locked", "pll_b_locked", "clock_source", "si5351c_status"};
+}
+
+SoapySDR::ArgInfo SoapyAirspy::getSensorInfo(const std::string &key) const
+{
+    SoapySDR::ArgInfo info;
+    info.key = key;
+
+    if (key == "gpsdo_locked") {
+        info.name = "GPSDO Locked";
+        info.description = "SI5351C CLKIN signal present (GPSDO 10MHz reference detected). "
+                           "Reads LOS_CLKIN bit from Device Status Register 0.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+    }
+    else if (key == "pll_a_locked") {
+        info.name = "PLL A Locked";
+        info.description = "SI5351C PLL A lock status. Loss of lock indicates reference instability.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+    }
+    else if (key == "pll_b_locked") {
+        info.name = "PLL B Locked";
+        info.description = "SI5351C PLL B lock status. PLL B generates the ADC sampling clock.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+    }
+    else if (key == "clock_source") {
+        info.name = "Clock Source";
+        info.description = "Active PLL reference source: XTAL (internal 25MHz) or CLKIN (external GPSDO).";
+        info.type = SoapySDR::ArgInfo::STRING;
+    }
+    else if (key == "si5351c_status") {
+        info.name = "SI5351C Status";
+        info.description = "Raw SI5351C Device Status Register 0 value (hex). "
+                           "Bits: [7]=SYS_INIT [6]=LOL_B [5]=LOL_A [4]=LOS_CLKIN [1:0]=REVID";
+        info.type = SoapySDR::ArgInfo::STRING;
+    }
+
+    return info;
+}
+
+std::string SoapyAirspy::readSensor(const std::string &key) const
+{
+    uint8_t reg0 = 0xFF;  // default = all errors
+    const bool reg0_ok = (airspy_si5351c_read(dev, 0, &reg0) == AIRSPY_SUCCESS);
+
+    if (key == "gpsdo_locked") {
+        if (!reg0_ok) return "false";
+        // LOS_CLKIN is bit 4: 0 = CLKIN signal present (GPSDO locked), 1 = lost
+        return (reg0 & 0x10) ? "false" : "true";
+    }
+    else if (key == "pll_a_locked") {
+        if (!reg0_ok) return "false";
+        // LOL_A is bit 5: 0 = locked, 1 = lost lock
+        return (reg0 & 0x20) ? "false" : "true";
+    }
+    else if (key == "pll_b_locked") {
+        if (!reg0_ok) return "false";
+        // LOL_B is bit 6: 0 = locked, 1 = lost lock
+        return (reg0 & 0x40) ? "false" : "true";
+    }
+    else if (key == "clock_source") {
+        uint8_t reg15 = 0;
+        if (airspy_si5351c_read(dev, 15, &reg15) != AIRSPY_SUCCESS) return "unknown";
+        return (reg15 & 0x04) ? "CLKIN (GPSDO)" : "XTAL (internal)";
+    }
+    else if (key == "si5351c_status") {
+        if (!reg0_ok) return "read_error";
+        char buf[16];
+        snprintf(buf, sizeof(buf), "0x%02X", reg0);
+        return std::string(buf);
+    }
+
     return "";
 }
