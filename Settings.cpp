@@ -81,11 +81,16 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
         }
     }
 
-    //program hardware with optimized defaults first
-    airspy_set_lna_gain(dev, lnaGain);
-    airspy_set_mixer_gain(dev, mixerGain);
-    airspy_set_vga_gain(dev, vgaGain);
-    airspy_set_packing(dev, bitPack ? 1 : 0);
+    //program hardware with optimized defaults first\n    // F4TNK: Check return values to detect hardware communication failures early
+    int ret;
+    ret = airspy_set_lna_gain(dev, lnaGain);
+    if (ret != AIRSPY_SUCCESS) SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_lna_gain(%d) failed: %d", lnaGain, ret);
+    ret = airspy_set_mixer_gain(dev, mixerGain);
+    if (ret != AIRSPY_SUCCESS) SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_mixer_gain(%d) failed: %d", mixerGain, ret);
+    ret = airspy_set_vga_gain(dev, vgaGain);
+    if (ret != AIRSPY_SUCCESS) SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_vga_gain(%d) failed: %d", vgaGain, ret);
+    ret = airspy_set_packing(dev, bitPack ? 1 : 0);
+    if (ret != AIRSPY_SUCCESS) SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_packing(%d) failed: %d", bitPack ? 1 : 0, ret);
 
     //apply arguments to settings — may override the defaults above
     for (const auto &info : this->getSettingInfo())
@@ -271,22 +276,30 @@ void SoapyAirspy::setGain(const int direction, const size_t channel, const doubl
 
 void SoapyAirspy::setGain(const int direction, const size_t channel, const std::string &name, const double value)
 {
+    // F4TNK: Clamp gain values to hardware range [0, 15] to prevent uint8_t wrap on negative
+    const double clamped = std::max(0.0, std::min(15.0, value));
     if (name == "LNA")
     {
-        lnaGain = uint8_t(value);
-        airspy_set_lna_gain(dev, lnaGain);
+        lnaGain = uint8_t(clamped);
+        int ret = airspy_set_lna_gain(dev, lnaGain);
+        if (ret != AIRSPY_SUCCESS)
+            SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_lna_gain(%d) failed: %d", lnaGain, ret);
     }
     else if (name == "MIX")
     {
-        mixerGain = uint8_t(value);
-        airspy_set_mixer_gain(dev, mixerGain);
+        mixerGain = uint8_t(clamped);
+        int ret = airspy_set_mixer_gain(dev, mixerGain);
+        if (ret != AIRSPY_SUCCESS)
+            SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_mixer_gain(%d) failed: %d", mixerGain, ret);
     }
     else if (name == "VGA")
     {
-        vgaGain = uint8_t(value);
-        airspy_set_vga_gain(dev, vgaGain);
+        vgaGain = uint8_t(clamped);
+        int ret = airspy_set_vga_gain(dev, vgaGain);
+        if (ret != AIRSPY_SUCCESS)
+            SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_vga_gain(%d) failed: %d", vgaGain, ret);
     }
-    SoapySDR_logf(SOAPY_SDR_DEBUG, "AirSpy setGain: %s=%d", name.c_str(), (int)value);
+    SoapySDR_logf(SOAPY_SDR_DEBUG, "AirSpy setGain: %s=%d (requested=%.1f)", name.c_str(), (int)clamped, value);
 }
 
 double SoapyAirspy::getGain(const int direction, const size_t channel, const std::string &name) const
@@ -551,14 +564,19 @@ void SoapyAirspy::writeSetting(const std::string &key, const std::string &value)
         catch (...) { linearityGain = 0; }
         if (linearityGain > 21) linearityGain = 21;
         airspy_set_linearity_gain(dev, linearityGain);
-        fprintf(stderr, "SoapyAirspy | linearity gain: %d\n", linearityGain);
+        // F4TNK: Linearity mode reprograms LNA/MIX/VGA via firmware lookup table.
+        // Clear cached individual gains since they no longer reflect hardware state.
+        lnaGain = 0; mixerGain = 0; vgaGain = 0;
+        fprintf(stderr, "SoapyAirspy | linearity gain: %d (individual gains reset)\n", linearityGain);
     }
     else if (key == "sensitivity_gain") {
         try { sensitivityGain = uint8_t(std::stoi(value)); }
         catch (...) { sensitivityGain = 0; }
         if (sensitivityGain > 21) sensitivityGain = 21;
         airspy_set_sensitivity_gain(dev, sensitivityGain);
-        fprintf(stderr, "SoapyAirspy | sensitivity gain: %d\n", sensitivityGain);
+        // F4TNK: Same as linearity — firmware reprograms individual gains
+        lnaGain = 0; mixerGain = 0; vgaGain = 0;
+        fprintf(stderr, "SoapyAirspy | sensitivity gain: %d (individual gains reset)\n", sensitivityGain);
     }
 }
 

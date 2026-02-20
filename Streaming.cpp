@@ -110,7 +110,13 @@ int SoapyAirspy::rx_callback(airspy_transfer *t)
 
     //copy into the buffer queue
     auto &buff = _buffs[_buf_tail];
-    buff.resize(bytes);
+    // F4TNK: Guard against realloc in USB callback hot path
+    if (bytes > buff.capacity()) {
+        _overflowEvent = true;
+        _overflowCount++;
+        return 0;
+    }
+    buff.resize(bytes);  // no-alloc: within pre-reserved capacity
     std::memcpy(buff.data(), t->samples, bytes);
     _buf_timestamps[_buf_tail] = nowNs;
 
@@ -236,6 +242,9 @@ int SoapyAirspy::activateStream(
             SoapySDR_logf(SOAPY_SDR_ERROR, "airspy_set_samplerate(%u) failed: %d", sampleRate, ret);
         }
         sampleRateChanged.store(false);
+        // F4TNK: Reset ring buffer state after sample rate change
+        _buf_head = 0; _buf_tail = 0; _buf_count = 0;
+        _overflowEvent = false;
     }
     int ret = airspy_start_rx(dev, &_rx_callback, (void *) this);
     if (ret != AIRSPY_SUCCESS) {
@@ -307,6 +316,9 @@ int SoapyAirspy::readStream(
             return SOAPY_SDR_STREAM_ERROR;
         }
         sampleRateChanged.store(false);
+        // F4TNK: Reset ring buffer state after sample rate change to prevent stale data
+        _buf_head = 0; _buf_tail = 0; _buf_count = 0;
+        bufferedElems = 0; _overflowEvent = false;
     }
 
     //this is the user's buffer for channel 0
@@ -411,5 +423,7 @@ void SoapyAirspy::releaseReadBuffer(
     const size_t handle)
 {
     //TODO this wont handle out of order releases
-    _buf_count--;
+    // F4TNK: Guard against underflow (size_t wraps to SIZE_MAX)
+    size_t expected = _buf_count.load();
+    while (expected > 0 && !_buf_count.compare_exchange_weak(expected, expected - 1));
 }
