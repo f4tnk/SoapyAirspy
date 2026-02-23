@@ -4,8 +4,9 @@
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![AirSpy R2](https://img.shields.io/badge/hardware-AirSpy%20R2-orange)]()
 [![SoapySDR](https://img.shields.io/badge/middleware-SoapySDR-purple)]()
+[![Optimizations](https://img.shields.io/badge/optimizations-30-brightgreen)]()
 
-> **27 targeted optimizations** to the SoapySDR wrapper for AirSpy R2,
+> **30 targeted optimizations** to the SoapySDR wrapper for AirSpy R2,
 > focused on **weak-signal satellite reception** (SatNOGS, APRS, AIS, telemetry).
 >
 > These changes sit between the application layer (GNU Radio, SDR++) and the
@@ -51,7 +52,7 @@ graph LR
     end
 
     A -->|USB 2.0<br/>bit-packed| B
-    B -->|Ring buffer<br/>15 × 512KB| C
+    B -->|Ring buffer<br/>48 × 512KB| C
     C -->|CF32 native<br/>SSE2 path| D
     C --> E
     C --> F
@@ -511,12 +512,12 @@ print('overflows:', sdr.readSetting('overflow_count'))
 |---|----------|-------------|---------|
 | 1 | Buffer | `DEFAULT_BUFFER_BYTES` 256KB → 512KB | `SoapyAirspy.hpp` |
 | 2 | Buffer | `DEFAULT_NUM_BUFFERS` 8 → 15 | `SoapyAirspy.hpp` |
-| 3 | Buffer | Configurable `buffers` stream arg (4–64) | `Streaming.cpp` |
+| 3 | Buffer | Configurable `buffers` stream arg (4–**128**) | `Streaming.cpp` |
 | 4 | Buffer | Configurable `buflen` stream arg | `Streaming.cpp` |
 | 5 | Buffer | Pre-allocation (`reserve` + `resize`) | `Streaming.cpp` |
 | 6 | Buffer | State reset on `setupStream()` | `Streaming.cpp` |
 | 7 | Buffer | Info logging (buffer config summary) | `Streaming.cpp` |
-| 8 | Overflow | Keep 2 newest (not drain all) | `Streaming.cpp` |
+| 8 | Overflow | Keep 2 newest (not drain all) — see Mod 28 for latest | `Streaming.cpp` |
 | 9 | Overflow | Atomic `_overflowCount` counter | `SoapyAirspy.hpp`, `Streaming.cpp` |
 | 10 | Overflow | Counter reset on `activateStream()` | `Streaming.cpp` |
 | 11 | Callback | Pre-computed `bytes` variable | `Streaming.cpp` |
@@ -538,6 +539,9 @@ print('overflows:', sdr.readSetting('overflow_count'))
 | 25 | Sample Rate | Snap to nearest supported rate + log warning | `Settings.cpp` |
 | 26 | Diagnostics | `readSetting("overflow_count")` — expose `_overflowCount` to gr-satnogs | `Settings.cpp` |
 | 27 | Observability | `getHardwareInfo()` — `airspy_version_string_read()` → `args["firmware"]` | `Settings.cpp` |
+| 28 | Overflow | Evict oldest ¼ ring on full — new buffer always written (continuity) | `Streaming.cpp` |
+| 29 | Buffer | Max stream buffers raised 64→128 for deep-buffering configurations | `Streaming.cpp` |
+| 30 | Diagnostics | Overflow warning includes ring size + headroom in seconds | `Streaming.cpp` |
 
 ---
 
@@ -612,9 +616,9 @@ sdr.setFrequency(SoapySDR.SOAPY_SDR_RX, 0, "RF", 435e6)
 sdr.writeSetting("sensitivity_gain", "15")
 sdr.writeSetting("ppm", "1.5")
 
-# 32 deep ring buffer for high-latency host
+# 48 deep ring buffer — 1.6 s headroom for WSL2 jitter + GR stalls
 stream = sdr.setupStream(SoapySDR.SOAPY_SDR_RX, SoapySDR.SOAPY_SDR_CF32, [0],
-    {"buffers": "32", "buflen": "1048576"})
+    {"buffers": "48", "buflen": "524288"})
 sdr.activateStream(stream)
 ```
 
@@ -628,7 +632,7 @@ graph TB
         A["📡 Antenna"] --> B["AirSpy R2<br/>12-bit @ 20 MSPS"]
         B --> C["USB 2.0<br/>Bit-packed ×0.75"]
         C --> D["libairspy F4TNK<br/>• 63-tap FIR<br/>• SSE2 IQ conv<br/>• DC removal"]
-        D --> E["SoapyAirspy F4TNK<br/>• 15×512KB ring<br/>• CF32 native<br/>• PPM correction"]
+        D --> E["SoapyAirspy F4TNK<br/>• 48×512KB ring<br/>• CF32 native<br/>• PPM correction"]
         E --> F["GNU Radio<br/>gr-satnogs<br/>Demodulation"]
         F --> G["📊 Decoded<br/>Telemetry"]
     end
