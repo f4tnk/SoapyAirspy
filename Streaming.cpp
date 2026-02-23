@@ -95,11 +95,18 @@ int SoapyAirspy::rx_callback(airspy_transfer *t)
     }
 
     //overflow condition: the caller is not reading fast enough
+    // F4TNK: Instead of silently dropping the new buffer, evict the oldest
+    // buffers to make room. This preserves the NEWEST data (most relevant
+    // for Doppler tracking / demodulator lock) rather than stalling.
     if (SDR_UNLIKELY(_buf_count == numBuffers))
     {
+        // Evict oldest quarter of the ring to make room
+        const size_t toDrain = numBuffers / 4;
+        _buf_head = (_buf_head + toDrain) % numBuffers;
+        _buf_count -= toDrain;
         _overflowEvent = true;
         _overflowCount++;
-        return 0;
+        // Fall through to write the new buffer below
     }
 
     // Mod 23: stamp receive time before memcpy (monotonic clock, no wall-time drift)
@@ -177,7 +184,7 @@ SoapySDR::Stream *SoapyAirspy::setupStream(
         try { numBuffers = std::stoul(args.at("buffers")); }
         catch (...) { numBuffers = DEFAULT_NUM_BUFFERS; }
         if (numBuffers < 4) numBuffers = 4;
-        if (numBuffers > 64) numBuffers = 64;
+        if (numBuffers > 128) numBuffers = 128; // F4TNK: raised from 64 for deep buffering
     }
     if (args.count("buflen") != 0) {
         try { reqBufferBytes = std::stoul(args.at("buflen")); }
@@ -285,7 +292,10 @@ int SoapyAirspy::deactivateStream(SoapySDR::Stream *stream, const int flags, con
 
     const auto overflows = _overflowCount.load();
     if (overflows > 0)
-        SoapySDR_logf(SOAPY_SDR_WARNING, "SoapyAirspy | session ended: %zu USB overflow(s) detected", overflows);
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+            "SoapyAirspy | session ended: %zu USB overflow(s) detected [ring=%zu bufs × %u samp, %.1f s headroom]",
+            overflows, numBuffers, bufferLength,
+            (double)(numBuffers * bufferLength) / sampleRate);
     else
         fprintf(stderr, "SoapyAirspy | session ended: 0 overflows\n");
     
