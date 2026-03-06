@@ -108,7 +108,9 @@ SoapyAirspy::SoapyAirspy(const SoapySDR::Kwargs &args)
     std::string ratesStr;
     for (size_t i = 0; i < rates.size(); i++) {
         if (i > 0) ratesStr += ", ";
-        ratesStr += std::to_string((unsigned)(rates[i] / 1e6)) + " MSPS";
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%g MSPS", rates[i] / 1e6);
+        ratesStr += buf;
     }
     fprintf(stderr, "SoapyAirspy | sample rates: %s\n", ratesStr.c_str());
 
